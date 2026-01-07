@@ -17,6 +17,7 @@ import {
   MessageCircle,
   Menu,
   Plus,
+  RefreshCw,
   LogOut,
   LogIn,
 } from 'lucide-react';
@@ -24,6 +25,7 @@ import { Logo } from '@/components/Logo';
 import { SearchBar } from '@/components/SearchBar';
 import { useSearch } from '@/contexts/SearchContext';
 import { openTaskForm } from '@/lib/openTaskForm';
+import { YouTrackSyncDialog } from '@/components/dialogs/projects/YouTrackSyncDialog';
 import { useProject } from '@/contexts/ProjectContext';
 import { useOpenProjectInEditor } from '@/hooks/useOpenProjectInEditor';
 import { OpenInIdeButton } from '@/components/ide/OpenInIdeButton';
@@ -112,6 +114,12 @@ export function Navbar() {
   const handleCreateTask = () => {
     if (projectId) {
       openTaskForm({ mode: 'create', projectId });
+    }
+  };
+
+  const handleSyncYouTrack = () => {
+    if (projectId) {
+      void YouTrackSyncDialog.show({ projectId });
     }
   };
 
@@ -219,6 +227,15 @@ export function Navbar() {
                       className="h-9 w-9"
                     />
                   )}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9"
+                    onClick={handleSyncYouTrack}
+                    aria-label="Sync from YouTrack"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
                   <Button
                     variant="ghost"
                     size="icon"

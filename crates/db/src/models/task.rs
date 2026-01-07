@@ -255,6 +255,34 @@ ORDER BY t.created_at DESC"#,
         .await
     }
 
+    pub async fn find_by_project_id_and_title_prefix(
+        pool: &SqlitePool,
+        project_id: Uuid,
+        title_prefix: &str,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let pattern = format!("{title_prefix}%");
+        sqlx::query_as::<_, Task>(
+            r#"SELECT
+  id,
+  project_id,
+  title,
+  description,
+  status,
+  parent_workspace_id,
+  shared_task_id,
+  created_at,
+  updated_at
+FROM tasks
+WHERE project_id = $1
+  AND title LIKE $2
+LIMIT 1"#,
+        )
+        .bind(project_id)
+        .bind(pattern)
+        .fetch_optional(pool)
+        .await
+    }
+
     pub async fn find_all_shared(pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error> {
         sqlx::query_as!(
             Task,

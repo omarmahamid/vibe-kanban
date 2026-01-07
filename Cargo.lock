@@ -5301,6 +5301,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "clap",
  "db",
  "deployment",
  "dotenv",

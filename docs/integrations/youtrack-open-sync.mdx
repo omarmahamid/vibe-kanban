@@ -1,0 +1,40 @@
+---
+title: YouTrack (Open → To Do) Sync
+description: Sync Open YouTrack sprint issues into Vibe Kanban as To Do tasks.
+---
+
+This repo includes a small Rust utility that pulls **only "Open"** issues from a specific YouTrack **Agile board + sprint**, and creates matching Vibe Kanban tasks **always in `To Do`** (no state mapping).
+
+## Requirements
+
+- A Vibe Kanban `project_id` (UUID)
+- A YouTrack permanent token with permission to read issues/boards
+- Agile board id and sprint id (from the YouTrack URL)
+
+## Run
+
+From the repo root:
+
+```bash
+cargo run -p server --bin sync_youtrack_open -- \
+  --project-id <VK_PROJECT_UUID> \
+  --youtrack-base-url https://track.personetics.com/youtrack/ \
+  --youtrack-token <YOUTRACK_TOKEN> \
+  --agile-id 65-52 \
+  --sprint-id 66-155467 \
+  --dry-run
+```
+
+Remove `--dry-run` to actually create tasks.
+
+## How "Open" is detected
+
+By default, the tool looks at the YouTrack custom field named `State` and treats value `Open` (case-insensitive) as open.
+
+Override if your instance uses a different field/value:
+
+```bash
+YOUTRACK_STATE_FIELD=Status YOUTRACK_OPEN_VALUE=Open \
+  cargo run -p server --bin sync_youtrack_open -- ...
+```
+

@@ -31,6 +31,10 @@ export {
   LinkProjectDialog,
   type LinkProjectResult,
 } from './projects/LinkProjectDialog';
+export {
+  YouTrackSyncDialog,
+  type YouTrackSyncDialogProps,
+} from './projects/YouTrackSyncDialog';
 
 // Task-related dialogs
 export {

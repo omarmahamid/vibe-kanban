@@ -385,6 +385,35 @@ export const projectsApi = {
   },
 };
 
+export type YouTrackOpenSyncRequest = {
+  project_id: string;
+  board_url: string;
+  youtrack_token: string;
+  state_field?: string;
+  open_value?: string;
+  dry_run?: boolean;
+};
+
+export type YouTrackOpenSyncResponse = {
+  open_issues_total: number;
+  created: number;
+  skipped_existing: number;
+  dry_run: boolean;
+  created_titles: string[];
+};
+
+export const integrationsApi = {
+  syncYouTrackOpen: async (
+    data: YouTrackOpenSyncRequest
+  ): Promise<YouTrackOpenSyncResponse> => {
+    const response = await makeRequest('/api/integrations/youtrack/open-sync', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+    return handleApiResponse<YouTrackOpenSyncResponse>(response);
+  },
+};
+
 // Task Management APIs
 export const tasksApi = {
   getById: async (taskId: string): Promise<Task> => {

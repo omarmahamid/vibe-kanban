@@ -76,6 +76,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("Forbidden: {0}")]
     Forbidden(String),
+    #[error("Upstream error: {0}")]
+    Upstream(String),
 }
 
 impl From<&'static str> for ApiError {
@@ -177,6 +179,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BadRequest"),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, "ConflictError"),
             ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "ForbiddenError"),
+            ApiError::Upstream(_) => (StatusCode::BAD_GATEWAY, "UpstreamError"),
         };
 
         let error_message = match &self {
@@ -199,6 +202,7 @@ impl IntoResponse for ApiError {
                 }
                 _ => format!("{}: {}", error_type, self),
             },
+            ApiError::Upstream(msg) => msg.clone(),
             ApiError::Multipart(_) => "Failed to upload file. Please ensure the file is valid and try again.".to_string(),
             ApiError::RemoteClient(err) => match err {
                 RemoteClientError::Auth => "Unauthorized. Please sign in again.".to_string(),
