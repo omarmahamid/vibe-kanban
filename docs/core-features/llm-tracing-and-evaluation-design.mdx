@@ -1,0 +1,286 @@
+---
+title: "LLM Tracing and Evaluation (Design)"
+description: "Implementation plan for end-to-end LLM cost tracing and automated quality evaluation using an LLM-as-judge"
+sidebarTitle: "LLM Tracing & Eval (Design)"
+---
+
+<Info>
+This is a design and rollout plan. It describes proposed data models, storage, and UI surfaces that are not implemented yet.
+</Info>
+
+## Decisions to confirm
+
+Before implementing, confirm these choices to avoid rework:
+
+1. **Storage scope**: Do you want *local-only* tracing (SQLite) or also *opt-in remote telemetry* (PostHog) for aggregate insights?
+2. **Data sensitivity**: Can we store prompt/output text for evaluation, or do we need redaction/hashing by default?
+3. **“Cost” definition**: Do you want to track **API spend**, **subscription spend**, or **estimated cost** based on provider list prices?
+4. **Evaluation target**: Should evaluation focus on the **assistant message**, the **diff/code output**, or both?
+
+## Overview
+
+This feature adds:
+
+- **End-to-end tracing** for LLM usage across the system, capturing tokens, latency, model/provider, and estimated cost per execution.
+- **Automated evaluation** where an LLM acts as a judge to score outputs against a rubric (for example: relevance, correctness, consistency, and policy adherence).
+
+The goal is to make cost and quality observable by **request**, **flow**, and **feature** so you can make data-driven changes to prompts, model choice, and orchestration.
+
+## Current state (repo-specific)
+
+- Agent execution is orchestrated via `ExecutionProcess` and streamed logs (see `crates/services/src/services/container.rs`).
+- Logs persisted to SQLite are primarily `stdout`/`stderr` JSONL (`crates/db/src/models/execution_process_logs.rs`).
+- Token usage is already present for some executors (for example, Codex emits `TokenUsageInfo`; Claude streams include `ClaudeUsage`), but it is not stored as a first-class, queryable dataset.
+- Telemetry exists via PostHog (opt-in) for coarse events, not LLM usage/cost breakdown.
+
+## Tracing goals and non-goals
+
+### Goals
+
+- Attribute tokens/latency/cost to:
+  - `execution_process_id` (primary unit of work)
+  - `session_id`, `workspace_id`, `task_id`, `project_id`
+  - **feature/run reason** (for example: coding agent, setup script, PR auto description)
+  - **executor + model** (Codex/Claude/Gemini/Qwen/etc.)
+- Support both:
+  - **real-time** (“what is this run costing right now?”)
+  - **historical** (“what did we spend last week on PR descriptions?”)
+- Provide a single schema that works even when token usage is missing (store `null`, keep latency/model/provider).
+
+### Non-goals (initially)
+
+- Perfect per-request provider billing reconciliation.
+- Full distributed tracing across external CLIs (we can correlate via `execution_process_id` even without W3C trace context support).
+
+## Proposed data model
+
+### 1) Normalised log event (UI-facing)
+
+Add a new normalised entry type representing LLM usage, so the UI can show token/cost badges alongside agent output:
+
+- `NormalizedEntryType::LlmUsage { provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, latency_ms, cost_usd_estimate, ... }`
+
+This is produced by executor-specific normalisers:
+
+- `crates/executors/src/executors/codex/normalize_logs.rs` (from `TokenUsageInfo`)
+- `crates/executors/src/executors/claude.rs` (from `ClaudeUsage`)
+- `crates/executors/src/executors/acp/normalize_logs.rs` (best-effort; often unknown tokens)
+
+<Note>
+Even if you do not expose this in the UI immediately, emitting the event unblocks the rest of the pipeline by creating a stable internal contract.
+</Note>
+
+### 2) First-class trace storage (queryable)
+
+Add new SQLite tables (names can be adjusted to match existing conventions):
+
+- `llm_calls`
+  - `id` (UUID)
+  - `execution_process_id` (FK)
+  - `session_id` (denormalised for query speed)
+  - `provider` (text, nullable)
+  - `model` (text, nullable)
+  - `started_at`, `completed_at` (timestamps)
+  - `latency_ms` (integer, nullable)
+  - `input_tokens`, `output_tokens` (integer, nullable)
+  - `cache_read_input_tokens`, `cache_creation_input_tokens` (integer, nullable)
+  - `total_tokens` (generated/derived at query time or stored)
+  - `cost_usd_estimate` (real, nullable)
+  - `pricing_source` (text: `config`, `hardcoded`, `unknown`)
+  - `error` (text, nullable)
+
+- `llm_call_tags` (optional, for flexible attribution)
+  - `llm_call_id` (FK)
+  - `key`, `value` (for `feature=pr_auto_description`, `agent=codex`, `run_reason=coding_agent`, etc.)
+
+Indexes:
+
+- `(execution_process_id, completed_at)`
+- `(provider, model, completed_at)`
+- `(session_id, completed_at)`
+
+<Tip>
+If you expect high write volume, keep `llm_calls` narrow and store large/variable metadata in a JSON column or `llm_call_tags`.
+</Tip>
+
+## Ingestion and attribution
+
+### Real-time ingestion (recommended)
+
+Add a small “LLM usage extractor” in the log pipeline in `crates/services/src/services/container.rs` that:
+
+1. Observes raw `stdout` lines as they stream.
+2. Recognises executor-specific usage signals (Codex token events, Claude usage deltas, etc.).
+3. Emits a structured `LlmUsage` record into:
+   - the in-memory message store (for UI), and
+   - the `llm_calls` table (for analytics).
+
+Why this approach:
+
+- Avoids expensive back-parsing of historical logs for dashboards.
+- Works even if the UI normalisation step changes over time.
+
+### Backfill ingestion (optional, later)
+
+Provide a one-off backfill job (Rust bin) that replays `execution_process_logs` for a time range and extracts token usage to populate `llm_calls`. This is useful if you want historical analytics without waiting for new runs.
+
+## Cost calculation
+
+### Pricing table
+
+Introduce a versioned pricing config (for example `crates/services/src/services/llm_pricing.toml` or JSON in config) that maps:
+
+- `provider`
+- `model` (exact string match plus optional prefix/wildcard support)
+- `input_cost_per_1m`, `output_cost_per_1m`
+- cache token pricing (if applicable)
+
+### Estimation rules
+
+- Compute `cost_usd_estimate` as:
+  - `(input_tokens / 1_000_000) * input_cost_per_1m`
+  - `(output_tokens / 1_000_000) * output_cost_per_1m`
+  - plus cache read/write components if supported.
+- If token counts are missing, store `null` cost and keep latency/model/provider.
+
+<Warning>
+“Cost” can be misleading when the user is on a subscription (for example, Claude Code) or routing through third-party proxies. Label this clearly as **estimated** unless you have a billing source of truth.
+</Warning>
+
+## Surfaces (reporting and UI)
+
+### Backend API
+
+Add read APIs (scoped by auth) to query aggregates:
+
+- By execution: `GET /execution_processes/:id/llm_calls`
+- By session/workspace: totals by day, model, provider
+- By feature tags: totals by `run_reason` and `executor`
+
+### Frontend UI
+
+Add optional surfaces (phased):
+
+1. **Process view**: show token + estimated cost summary for the selected execution process.
+2. **Session view**: aggregate across all processes in a session (useful for multi-turn tasks).
+3. **Settings/analytics**: cost trend charts (if you want user-facing cost control).
+
+## Evaluation framework (LLM-as-judge)
+
+### What gets evaluated
+
+Start with a narrowly scoped, high-signal target:
+
+- **Assistant final message quality** for specific flows (for example: PR auto description output).
+
+Then expand to more complex targets:
+
+- Diff-aware evaluation (judge reviews the patch summary + key diffs)
+- Policy adherence (tool safety, sensitive data handling)
+
+### Evaluation artefacts
+
+Define a small, explicit format for evaluation specs (stored in-repo):
+
+- `evaluation_suites/<suite>.yaml`
+  - `cases[]`: input context + expected behaviours (not necessarily a single “correct” output)
+  - `rubric`: criteria + scoring scale
+  - `judge_model`: provider/model + temperature + max tokens
+  - `prompt_template`: consistent judge prompt
+
+### Execution model
+
+Run evaluation as a background job that:
+
+1. Selects samples (from fixtures or from traced production runs).
+2. Builds a judge prompt with:
+   - the task context
+   - the candidate output
+   - the rubric
+   - explicit instructions to output strict JSON scores
+3. Calls the judge model.
+4. Stores results with strong provenance (suite version, judge model, prompt hash).
+
+### Evaluation storage
+
+Add tables:
+
+- `llm_evaluations` (one row per case run)
+  - `id`, `suite`, `case_id`, `candidate_execution_process_id` (nullable)
+  - `judge_provider`, `judge_model`
+  - `scores_json` (per-criterion + overall)
+  - `explanation` (optional, text)
+  - `created_at`
+
+<Note>
+If you store explanations, treat them as potentially sensitive (they may include quoted user content).
+</Note>
+
+### Judge quality controls
+
+To keep “LLM-as-judge” reliable:
+
+- Use a fixed judge prompt and low temperature.
+- Require strict JSON output and validate with a schema.
+- Calibrate periodically against human-labelled samples.
+- Run “judge drift” checks when changing judge model/version.
+
+## Rollout plan (phased)
+
+<Steps>
+<Step title="Phase 1: Capture structured usage events">
+  Add `NormalizedEntryType::LlmUsage` and emit it from Codex + Claude normalisers.
+
+  <Check>
+  You can see token usage events show up in the live log stream (even if the UI does not render them yet).
+  </Check>
+</Step>
+
+<Step title="Phase 2: Persist queryable traces">
+  Add `llm_calls` table + ingestion to store usage per execution process.
+
+  <Check>
+  You can query per-run totals for tokens, latency, and estimated cost from SQLite.
+  </Check>
+</Step>
+
+<Step title="Phase 3: Add reporting surfaces">
+  Add backend endpoints and a minimal UI summary (per execution + per session).
+</Step>
+
+<Step title="Phase 4: Implement evaluation suites">
+  Add suite definitions, the evaluation runner, and result storage. Start with one flow (for example PR description generation).
+</Step>
+
+<Step title="Phase 5: Continuous evaluation in CI">
+  Add a “golden” evaluation suite that runs in CI with a stable judge configuration (or a mocked judge in CI, with real judge runs in nightly jobs).
+</Step>
+</Steps>
+
+## Risks and mitigations
+
+- **Token usage unavailable for some executors**: store partial traces (latency/model) and track “coverage” as a metric.
+- **Privacy**: default to storing counts + metadata; gate raw prompt/output storage behind explicit opt-in.
+- **Cost accuracy**: present costs as “estimated” with a visible pricing source/version.
+- **Performance**: avoid heavy parsing in the hot path; use fast line-based detection and defer expensive work to a background task.
+
+## Implementation checklist (by repo area)
+
+- **DB**
+  - Add migrations for `llm_calls` (and optionally `llm_evaluations`).
+  - Add SQLx models in `crates/db/src/models/`.
+- **Executors**
+  - Emit `LlmUsage` entries from Codex + Claude parsing.
+  - Define a stable mapping of executor → provider/model string fields.
+- **Services / ingestion**
+  - Extract usage from streaming logs in `crates/services/src/services/container.rs`.
+  - Persist `llm_calls` rows and (optionally) send aggregate PostHog events when telemetry is enabled.
+- **Server API**
+  - Add endpoints to read per-execution and per-session aggregates.
+  - Expose types via `crates/server/src/bin/generate_types.rs` (ts-rs) for frontend consumption.
+- **Frontend**
+  - Add a compact “tokens / cost” summary to the process and session views.
+  - Add filtering by model/provider and export (CSV) if needed.
+- **Evaluation runner**
+  - Add an offline runner (for example a new Rust bin) that reads suite definitions, runs judges, and writes `llm_evaluations`.
+  - Add a minimal “suite report” view (table + sparkline) once data exists.
